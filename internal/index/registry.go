@@ -7,6 +7,11 @@ import (
 
 type Registry struct{ Trees map[string]*Tree }
 
+// Build derives historical candidate sets from every version that is still
+// physically retained. Expired versions are intentionally included while they
+// exist: a snapshot before their expiry may still read them, and the access
+// path rechecks the real version at the requested snapshot. Vacuum removes the
+// versions first and rebuilds, so candidates and visibility agree.
 func Build(c *catalog.Catalog, s *versions.Store) *Registry {
 	r := &Registry{Trees: map[string]*Tree{}}
 	for name, definition := range c.Indexes {

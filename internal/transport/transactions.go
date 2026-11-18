@@ -2,6 +2,7 @@ package transport
 
 import (
 	"lamina/internal/datum"
+	"lamina/internal/engine"
 	"net/http"
 )
 
@@ -21,14 +22,19 @@ func (s *Server) begin(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Relation   string    `json:"relation"`
-		Row        datum.Row `json:"row"`
-		InsertOnly bool      `json:"insert_only"`
+		Relation   string         `json:"relation"`
+		Row        datum.Row      `json:"row"`
+		InsertOnly bool           `json:"insert_only"`
+		Expiry     *engine.Expiry `json:"expiry"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if err := s.db.Put(r.PathValue("tx"), in.Relation, in.Row, in.InsertOnly); err != nil {
+	expiry := engine.Expiry{}
+	if in.Expiry != nil {
+		expiry = *in.Expiry
+	}
+	if err := s.db.Put(r.PathValue("tx"), in.Relation, in.Row, in.InsertOnly, expiry); err != nil {
 		respondError(w, err)
 		return
 	}

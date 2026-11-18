@@ -127,7 +127,7 @@ func (w *WAL) recover() error {
 		if err = json.Unmarshal(payload, &r); err != nil {
 			return fmt.Errorf("journal json at %d: %w", offset, err)
 		}
-		if r.Format != 1 || r.Sequence != last+1 {
+		if !SupportedFormat(r.Format) || r.Sequence != last+1 {
 			return fmt.Errorf("journal sequence or format mismatch at %d", offset)
 		}
 		w.Records = append(w.Records, r)
@@ -152,7 +152,12 @@ func (w *WAL) Append(r Record) error {
 	if r.Sequence != w.Base+uint64(len(w.Records))+1 {
 		return fmt.Errorf("noncontiguous journal sequence")
 	}
-	r.Format = 1
+	if r.Format == 0 {
+		r.Format = 1
+	}
+	if !SupportedFormat(r.Format) {
+		return fmt.Errorf("unsupported journal format")
+	}
 	payload, err := json.Marshal(r)
 	if err != nil {
 		return err

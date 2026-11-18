@@ -7,8 +7,8 @@ import (
 )
 
 func (d *DB) apply(r journal.Record) error {
-	if r.Sequence != d.sequence+1 || r.Format != 1 {
-		return fmt.Errorf("invalid record sequence")
+	if r.Sequence != d.sequence+1 || !journal.SupportedFormat(r.Format) {
+		return fmt.Errorf("invalid record sequence or format")
 	}
 	switch r.Kind {
 	case "relation":
@@ -52,13 +52,20 @@ func (d *DB) apply(r journal.Record) error {
 					return fmt.Errorf("stored primary mismatch")
 				}
 			}
+			if m.ExpiresAt != 0 && m.ExpiresAt <= r.Sequence {
+				return fmt.Errorf("invalid version expiry")
+			}
 		}
 		d.store.Apply(r.Sequence, r.Writes)
 	case "vacuum":
 		if r.Horizon < d.horizon || r.Horizon > d.sequence {
 			return fmt.Errorf("invalid vacuum horizon")
 		}
-		d.store.Vacuum(r.Horizon)
+		// Replay must reconstruct exactly what the live database held, otherwise
+		// a restart could reveal rows that expiry had already hidden or keep
+		// versions a live vacuum had removed. The head is the record's own
+		// sequence: no later version exists when this record is applied.
+		d.store.Vacuum(r.Horizon, r.Sequence)
 		d.horizon = r.Horizon
 	default:
 		return fmt.Errorf("unknown record kind %s", r.Kind)

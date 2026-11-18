@@ -13,6 +13,10 @@ import (
 type staged struct {
 	Mutation   versions.Mutation
 	InsertOnly bool
+	// TTL is unresolved until commit, when it becomes commit sequence + TTL.
+	// Mutation.ExpiresAt carries an absolute expiry already supplied by the
+	// caller. At most one of the two is set.
+	TTL *uint64
 }
 type Transaction struct {
 	ID       string `json:"id"`
@@ -24,6 +28,17 @@ type Transaction struct {
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
 	Writes   int    `json:"writes"`
+}
+
+// Expiry selects a row's validity window. ExpiresAt is an absolute commit
+// sequence; TTL is a number of commit sequences counted from the committing
+// record. Expiry is measured in commit sequences rather than wall-clock time so
+// that the same historical query always yields the same answer, regardless of
+// restart or when reclamation runs. Supplying neither makes the row permanent
+// until deleted; supplying both is rejected.
+type Expiry struct {
+	ExpiresAt *uint64 `json:"expires_at,omitempty"`
+	TTL       *uint64 `json:"ttl,omitempty"`
 }
 
 func (d *DB) Begin(readOnly bool) (Transaction, error) {
@@ -52,7 +67,7 @@ func (d *DB) tx(id string) (*Transaction, error) {
 	}
 	return tx, nil
 }
-func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
+func (d *DB) Put(id, table string, row datum.Row, insertOnly bool, expiry Expiry) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
@@ -76,6 +91,9 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 	if err != nil {
 		return invalid(err)
 	}
+	if err = expiry.validate(); err != nil {
+		return err
+	}
 	key := r.Key(normalized)
 	rows := d.store.Scan(table, tx.Snapshot)
 	overlay(rows, tx.writes, table)
@@ -90,7 +108,27 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 	if err = tx.reserve(table, key); err != nil {
 		return err
 	}
-	tx.writes[table][key] = staged{Mutation: versions.Mutation{Relation: table, Key: key, Row: normalized}, InsertOnly: insertOnly}
+	s := staged{Mutation: versions.Mutation{Relation: table, Key: key, Row: normalized}, InsertOnly: insertOnly, TTL: expiry.TTL}
+	if expiry.ExpiresAt != nil {
+		s.Mutation.ExpiresAt = *expiry.ExpiresAt
+	}
+	tx.writes[table][key] = s
+	return nil
+}
+
+// validate rejects ambiguous expiry inputs. TTL 0 would already be expired at
+// its own commit sequence, so it is rejected; TTL 1 keeps the row readable for
+// exactly the snapshot at its committing sequence.
+func (e Expiry) validate() error {
+	if e.ExpiresAt != nil && e.TTL != nil {
+		return fault("invalid", "expires_at and ttl are mutually exclusive")
+	}
+	if e.ExpiresAt != nil && *e.ExpiresAt == 0 {
+		return fault("invalid", "expires_at must be a positive commit sequence")
+	}
+	if e.TTL != nil && *e.TTL == 0 {
+		return fault("invalid", "ttl must be at least 1 commit sequence")
+	}
 	return nil
 }
 func (tx *Transaction) reserve(table, key string) error {
@@ -163,6 +201,10 @@ func (d *DB) Commit(id string) (Commit, error) {
 		return Commit{}, err
 	}
 	defer delete(d.transactions, id)
+	// A staged write is published at the next commit sequence, so relative TTLs
+	// and absolute expiries are resolved against exactly that sequence before
+	// validation. A failed commit discards them together with the write set.
+	sequence := d.sequence + 1
 	writes := make([]versions.Mutation, 0)
 	for table, mutations := range tx.writes {
 		for key, m := range mutations {
@@ -170,7 +212,17 @@ func (d *DB) Commit(id string) (Commit, error) {
 				d.conflicts++
 				return Commit{}, fault("conflict", "write conflict on %s", table)
 			}
-			writes = append(writes, m.Mutation)
+			mutation := m.Mutation
+			if m.TTL != nil {
+				if *m.TTL > ^uint64(0)-sequence {
+					return Commit{}, fault("invalid", "ttl overflows commit sequence")
+				}
+				mutation.ExpiresAt = sequence + *m.TTL
+			}
+			if mutation.ExpiresAt != 0 && mutation.ExpiresAt <= sequence {
+				return Commit{}, fault("invalid", "expiry must be after the committing sequence %d", sequence)
+			}
+			writes = append(writes, mutation)
 		}
 		if err = d.unique(table, tx.writes); err != nil {
 			d.conflicts++

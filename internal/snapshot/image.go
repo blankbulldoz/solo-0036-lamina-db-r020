@@ -13,6 +13,15 @@ import (
 
 const MaxImage = 128 << 20
 
+// Format 1 is the original image layout. Format 2 adds per-version expiry.
+// Images are written at the current format and both are accepted on read, so a
+// backup taken now fails closed in a build that cannot interpret expiry instead
+// of silently treating expired rows as permanent.
+const (
+	FormatLegacy  = 1
+	FormatCurrent = 2
+)
+
 type Image struct {
 	Format   int              `json:"format"`
 	Sequence uint64           `json:"sequence"`
@@ -26,8 +35,11 @@ type Envelope struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
+// SupportedImageFormat reports whether this build can interpret an image.
+func SupportedImageFormat(format int) bool { return format == FormatLegacy || format == FormatCurrent }
+
 func Encode(image Image) ([]byte, error) {
-	image.Format = 1
+	image.Format = FormatCurrent
 	b, err := json.Marshal(image)
 	if err != nil {
 		return nil, err
@@ -69,7 +81,7 @@ func Read(path string) (Image, error) {
 	return Decode(b)
 }
 func Validate(image Image) error {
-	if image.Format != 1 || image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
+	if !SupportedImageFormat(image.Format) || image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
 		return fmt.Errorf("invalid image header")
 	}
 	for name, r := range image.Catalog.Relations {
@@ -102,6 +114,12 @@ func Validate(image Image) error {
 			for _, v := range chain {
 				if v.Sequence <= last || v.Sequence > image.Sequence || v.Sequence <= r.Created {
 					return fmt.Errorf("invalid version order")
+				}
+				if v.ExpiresAt != 0 && v.ExpiresAt <= v.Sequence {
+					return fmt.Errorf("invalid version expiry")
+				}
+				if image.Format == FormatLegacy && v.ExpiresAt != 0 {
+					return fmt.Errorf("legacy image cannot carry expiry")
 				}
 				last = v.Sequence
 				if !v.Deleted {

@@ -98,7 +98,7 @@ func (d *DB) Close() error {
 }
 func (d *DB) publish(r journal.Record) error {
 	r.Sequence = d.sequence + 1
-	r.Format = 1
+	r.Format = journal.CurrentFormat
 	if err := d.wal.Append(r); err != nil {
 		return fault("unavailable", "durable commit failed: %s", err)
 	}

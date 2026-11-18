@@ -11,7 +11,7 @@ import (
 )
 
 func (d *DB) image() snapshot.Image {
-	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
+	return snapshot.Image{Format: snapshot.FormatCurrent, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
 }
 func (d *DB) Checkpoint() (uint64, error) {
 	d.mu.Lock()
@@ -70,27 +70,89 @@ func Restore(dir string, data []byte) error {
 	installed = true
 	return nil
 }
-func (d *DB) Vacuum(requested uint64) (versions.VacuumResult, error) {
+
+// VacuumRequest describes one reclamation decision. Horizon is optional and
+// defaults to the current head. Retain optionally keeps at least that many
+// recent commit sequences readable, choosing reproducible history over prompt
+// space release. DryRun reports the same decision without publishing it.
+type VacuumRequest struct {
+	Horizon *uint64 `json:"horizon,omitempty"`
+	Retain  *uint64 `json:"retain,omitempty"`
+	DryRun  bool    `json:"dry_run,omitempty"`
+}
+
+// Vacuum advances the physical retention floor. The effective floor is the
+// smallest of the requested horizon, the oldest active transaction snapshot,
+// and head-retain; it never moves backwards. Expiry itself is unaffected: it is
+// decided per snapshot from version expiry metadata, so the answers for every
+// snapshot at or above the new floor stay identical before and after restart.
+func (d *DB) Vacuum(request VacuumRequest) (versions.VacuumResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
 		return versions.VacuumResult{}, err
 	}
+	requested := d.sequence
+	if request.Horizon != nil {
+		requested = *request.Horizon
+	}
 	if requested > d.sequence || requested < d.horizon {
-		return versions.VacuumResult{}, fault("invalid", "vacuum horizon outside retained interval")
+		return versions.VacuumResult{}, fault("invalid", "vacuum horizon outside retained interval %d..%d", d.horizon, d.sequence)
 	}
 	horizon := requested
-	for _, tx := range d.transactions {
-		if tx.Snapshot < horizon {
-			horizon = tx.Snapshot
+	result := versions.VacuumResult{Requested: requested}
+	if request.Retain != nil {
+		// Keep at least this many recent commit sequences readable. The floor may
+		// never advance past head-retain, so history stays reproducible at the
+		// price of holding more versions in memory.
+		limit := uint64(0)
+		if *request.Retain < d.sequence {
+			limit = d.sequence - *request.Retain
+		}
+		if limit < horizon {
+			horizon = limit
+			result.LimitedByPolicy = true
 		}
 	}
-	beforeKeys, beforeVersions := d.store.Count()
-	_ = beforeKeys
+	if oldest, ok := d.oldestSnapshot(); ok && oldest < horizon {
+		horizon = oldest
+		result.PinnedByReader = true
+		result.PinnedBy = oldest
+	}
+	if horizon < d.horizon {
+		horizon = d.horizon
+	}
+	result.Pinned = horizon < requested
+	result.Horizon = horizon
+	result.DryRun = request.DryRun
+
+	head := d.sequence
+	plan := d.store.Plan(horizon, head)
+	plan.Requested = result.Requested
+	plan.Horizon = horizon
+	plan.Pinned = result.Pinned
+	plan.PinnedByReader = result.PinnedByReader
+	plan.PinnedBy = result.PinnedBy
+	plan.LimitedByPolicy = result.LimitedByPolicy
+	plan.DryRun = request.DryRun
+	if request.DryRun || horizon == d.horizon {
+		return plan, nil
+	}
 	if err := d.publish(journal.Record{Kind: "vacuum", Horizon: horizon}); err != nil {
 		return versions.VacuumResult{}, err
 	}
-	_, remaining := d.store.Count()
 	d.indexes = index.Build(d.catalog, d.store)
-	return versions.VacuumResult{Horizon: horizon, Removed: beforeVersions - remaining, Retained: remaining, Pinned: horizon < requested}, nil
+	return plan, nil
+}
+
+func (d *DB) oldestSnapshot() (uint64, bool) {
+	var oldest uint64
+	found := false
+	for _, tx := range d.transactions {
+		if !found || tx.Snapshot < oldest {
+			oldest = tx.Snapshot
+			found = true
+		}
+	}
+	return oldest, found
 }

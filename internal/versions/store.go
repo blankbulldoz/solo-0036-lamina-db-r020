@@ -3,15 +3,17 @@ package versions
 import "lamina/internal/datum"
 
 type Mutation struct {
-	Relation string    `json:"relation"`
-	Key      string    `json:"key"`
-	Row      datum.Row `json:"row,omitempty"`
-	Deleted  bool      `json:"deleted,omitempty"`
+	Relation  string    `json:"relation"`
+	Key       string    `json:"key"`
+	Row       datum.Row `json:"row,omitempty"`
+	Deleted   bool      `json:"deleted,omitempty"`
+	ExpiresAt uint64    `json:"expires_at,omitempty"`
 }
 type Version struct {
-	Sequence uint64    `json:"sequence"`
-	Row      datum.Row `json:"row,omitempty"`
-	Deleted  bool      `json:"deleted,omitempty"`
+	Sequence  uint64    `json:"sequence"`
+	Row       datum.Row `json:"row,omitempty"`
+	Deleted   bool      `json:"deleted,omitempty"`
+	ExpiresAt uint64    `json:"expires_at,omitempty"`
 }
 type Store struct {
 	Tables map[string]map[string][]Version `json:"tables"`
@@ -26,10 +28,18 @@ func (s *Store) Ensure(name string) {
 func (s *Store) Apply(seq uint64, writes []Mutation) {
 	for _, m := range writes {
 		s.Ensure(m.Relation)
-		s.Tables[m.Relation][m.Key] = append(s.Tables[m.Relation][m.Key], Version{Sequence: seq, Row: datum.Clone(m.Row), Deleted: m.Deleted})
+		s.Tables[m.Relation][m.Key] = append(s.Tables[m.Relation][m.Key], Version{Sequence: seq, Row: datum.Clone(m.Row), Deleted: m.Deleted, ExpiresAt: m.ExpiresAt})
 	}
 }
-func Visible(chain []Version, at uint64) (Version, bool) {
+
+// ExpiredAt reports whether a version's validity window has ended at snapshot
+// "at". Validity is measured in commit sequences, never wall-clock time, so an
+// answer for a given sequence is reproducible after restart and after vacuum.
+func ExpiredAt(v Version, at uint64) bool { return v.ExpiresAt > 0 && at >= v.ExpiresAt }
+
+// latestAt locates the newest version with sequence <= at without judging
+// whether that version is visible.
+func latestAt(chain []Version, at uint64) (Version, bool) {
 	lo, hi := 0, len(chain)
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -42,8 +52,18 @@ func Visible(chain []Version, at uint64) (Version, bool) {
 	if lo == 0 {
 		return Version{}, false
 	}
-	v := chain[lo-1]
-	return v, !v.Deleted
+	return chain[lo-1], true
+}
+
+// Visible returns the row visible at a snapshot. A tombstone or an expired
+// newest version makes the tuple absent; older versions never reappear,
+// because expiry is a logical end of validity, not a rollback.
+func Visible(chain []Version, at uint64) (Version, bool) {
+	v, ok := latestAt(chain, at)
+	if !ok || v.Deleted || ExpiredAt(v, at) {
+		return v, false
+	}
+	return v, true
 }
 func (s *Store) Read(table, key string, at uint64) (datum.Row, bool) {
 	v, ok := Visible(s.Tables[table][key], at)
